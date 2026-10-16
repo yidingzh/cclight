@@ -29,6 +29,14 @@ final class StateStore: ObservableObject {
 
     private var stream: FSEventStreamRef?
     private var idleTimer: DispatchSourceTimer?
+    /// Fallback poll: if the FSEvents stream silently dies (observed after
+    /// days of uptime — app stays running but never re-reads state.json),
+    /// this timer re-reads the file whenever its mtime changes, so a dead
+    /// stream can't leave the overlay permanently stale. We only reload on
+    /// mtime change (not unconditionally) because `reload()` restarts the
+    /// idle timer, which would stop waiting → idle from ever firing.
+    private var pollTimer: DispatchSourceTimer?
+    private var lastMtime: Date?
     private let idleTimeout: TimeInterval
     /// First reload after `start()` shouldn't chime — otherwise launching
     /// the app while a session is already waiting would ding immediately,
@@ -74,6 +82,29 @@ final class StateStore: ObservableObject {
         self.stream = stream
         FSEventStreamSetDispatchQueue(stream, .main)
         FSEventStreamStart(stream)
+
+        startPollTimer()
+    }
+
+    /// Every 10s, stat state.json and `reload()` only if it changed. Cheap
+    /// insurance against a dead FSEventStream (see pollTimer doc comment).
+    private func startPollTimer() {
+        lastMtime = try? FileManager.default.attributesOfItem(
+            atPath: Paths.stateFile.path
+        )[.modificationDate] as? Date
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 10, repeating: 10)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let mtime = (try? FileManager.default.attributesOfItem(
+                atPath: Paths.stateFile.path
+            )[.modificationDate] as? Date) ?? nil
+            guard mtime != self.lastMtime else { return }
+            NSLog("cclight: poll timer detected state.json change (FSEvents missed it?) — reloading")
+            self.reload()
+        }
+        pollTimer = timer
+        timer.resume()
     }
 
     func stop() {
@@ -83,12 +114,17 @@ final class StateStore: ObservableObject {
             FSEventStreamRelease(stream)
             self.stream = nil
         }
+        pollTimer?.cancel()
+        pollTimer = nil
         idleTimer?.cancel()
         idleTimer = nil
     }
 
     /// Re-read state.json, recompute merged state, manage idle timer.
     private func reload() {
+        lastMtime = (try? FileManager.default.attributesOfItem(
+            atPath: Paths.stateFile.path
+        )[.modificationDate] as? Date) ?? lastMtime
         let rawSnapshot = (try? StateFile.read()) ?? StateSnapshot()
 
         // Liveness: for entries with a pid, check `kill(pid, 0)`. Alive →
